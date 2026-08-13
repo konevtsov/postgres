@@ -194,7 +194,7 @@ hash_check_metapage(HashCheckState *state, Page metapage)
 	uint32		required_nmaps;
 
 	if (opaque->hasho_page_id != HASHO_PAGE_ID ||
-		(opaque->hasho_flag & LH_PAGE_TYPE) != LH_META_PAGE ||
+		opaque->hasho_flag != LH_META_PAGE ||
 		opaque->hasho_prevblkno != InvalidBlockNumber ||
 		opaque->hasho_nextblkno != InvalidBlockNumber ||
 		opaque->hasho_bucket != InvalidBucket)
@@ -212,7 +212,9 @@ hash_check_metapage(HashCheckState *state, Page metapage)
 						RelationGetRelationName(state->rel)),
 				 errhint("Please REINDEX it.")));
 
-	if (metap->hashm_maxbucket > metap->hashm_highmask ||
+	if (metap->hashm_maxbucket < 1 ||
+		metap->hashm_maxbucket < metap->hashm_lowmask ||
+		metap->hashm_maxbucket > metap->hashm_highmask ||
 		(uint64) metap->hashm_maxbucket + 1 >= state->nblocks ||
 		(metap->hashm_highmask & (metap->hashm_highmask + 1)) != 0 ||
 		metap->hashm_lowmask != (metap->hashm_highmask >> 1))
@@ -345,6 +347,7 @@ hash_check_page_opaque(HashCheckState *state, Page page, BlockNumber blkno,
 {
 	HashPageOpaque opaque = HashPageGetOpaque(page);
 	uint16		pagetype = opaque->hasho_flag & LH_PAGE_TYPE;
+	uint16		allowed_flags;
 
 	if (opaque->hasho_page_id != HASHO_PAGE_ID)
 		ereport(ERROR,
@@ -361,6 +364,17 @@ hash_check_page_opaque(HashCheckState *state, Page page, BlockNumber blkno,
 				 errdetail_internal("Expected %s page, found %s page.",
 									 primary ? "bucket" : "overflow",
 									 hash_page_type_string(pagetype)),
+					 errhint("Please REINDEX it.")));
+
+	allowed_flags = (primary ?
+					 (LH_BUCKET_PAGE | LH_BUCKET_BEING_POPULATED |
+					  LH_BUCKET_BEING_SPLIT | LH_BUCKET_NEEDS_SPLIT_CLEANUP) :
+					 LH_OVERFLOW_PAGE) | LH_PAGE_HAS_DEAD_TUPLES;
+	if (opaque->hasho_flag & ~allowed_flags)
+		ereport(ERROR,
+				(errcode(ERRCODE_INDEX_CORRUPTED),
+				 errmsg("index \"%s\" block %u has invalid hash page flags",
+						RelationGetRelationName(state->rel), blkno),
 				 errhint("Please REINDEX it.")));
 
 	if (opaque->hasho_bucket != bucket)
@@ -404,6 +418,13 @@ hash_check_tuple_page(HashCheckState *state, Page page, BlockNumber blkno,
 	HashPageOpaque opaque = HashPageGetOpaque(page);
 	bool		allow_misbucket = split_cleanup || H_BUCKET_BEING_SPLIT(opaque);
 
+	if (maxoff > MaxIndexTuplesPerPage)
+		ereport(ERROR,
+				(errcode(ERRCODE_INDEX_CORRUPTED),
+				 errmsg("index \"%s\" has page %u with exceeding count of tuples",
+						RelationGetRelationName(state->rel), blkno),
+				 errhint("Please REINDEX it.")));
+
 	if (allow_misbucket)
 		cleanup_bucket = _hash_get_newbucket_from_oldbucket(state->rel, bucket,
 															state->metap.hashm_lowmask,
@@ -438,8 +459,9 @@ hash_check_tuple(HashCheckState *state, Page page, BlockNumber blkno,
 								 blkno, offnum, ItemIdGetLength(itemid))));
 
 	tupsize = IndexTupleSize(itup);
+	dataoff = IndexInfoFindDataOffset(itup->t_info);
 
-	if (tupsize < sizeof(IndexTupleData) ||
+	if (tupsize != MAXALIGN(dataoff + sizeof(uint32)) ||
 		MAXALIGN(tupsize) != MAXALIGN(ItemIdGetLength(itemid)))
 		ereport(ERROR,
 				(errcode(ERRCODE_INDEX_CORRUPTED),
@@ -457,7 +479,6 @@ hash_check_tuple(HashCheckState *state, Page page, BlockNumber blkno,
 				 errdetail_internal("Index tid=(%u,%u) t_info=0x%04x.",
 									 blkno, offnum, itup->t_info)));
 
-	dataoff = IndexInfoFindDataOffset(itup->t_info);
 	if (tupsize < dataoff + sizeof(uint32))
 		ereport(ERROR,
 				(errcode(ERRCODE_INDEX_CORRUPTED),
@@ -552,7 +573,7 @@ hash_check_bitmap_pages(HashCheckState *state)
 		opaque = HashPageGetOpaque(page);
 
 		if (opaque->hasho_page_id != HASHO_PAGE_ID ||
-			(opaque->hasho_flag & LH_PAGE_TYPE) != LH_BITMAP_PAGE ||
+			opaque->hasho_flag != LH_BITMAP_PAGE ||
 			opaque->hasho_prevblkno != InvalidBlockNumber ||
 			opaque->hasho_nextblkno != InvalidBlockNumber ||
 			opaque->hasho_bucket != InvalidBucket ||
@@ -720,7 +741,7 @@ hash_check_unreachable_page(HashCheckState *state, BlockNumber blkno)
 
 	if (state->bitmap_pages[blkno])
 	{
-		if (pagetype != LH_BITMAP_PAGE ||
+		if (opaque->hasho_flag != LH_BITMAP_PAGE ||
 			opaque->hasho_prevblkno != InvalidBlockNumber ||
 			opaque->hasho_nextblkno != InvalidBlockNumber ||
 			opaque->hasho_bucket != InvalidBucket)
@@ -732,7 +753,9 @@ hash_check_unreachable_page(HashCheckState *state, BlockNumber blkno)
 	}
 	else if (pagetype == LH_UNUSED_PAGE)
 	{
-		if (opaque->hasho_prevblkno != InvalidBlockNumber ||
+		if (opaque->hasho_flag != LH_UNUSED_PAGE ||
+			PageGetMaxOffsetNumber(page) != InvalidOffsetNumber ||
+			opaque->hasho_prevblkno != InvalidBlockNumber ||
 			opaque->hasho_nextblkno != InvalidBlockNumber ||
 			opaque->hasho_bucket != InvalidBucket)
 			ereport(ERROR,
