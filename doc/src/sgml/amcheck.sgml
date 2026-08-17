@@ -208,6 +208,30 @@ ORDER BY c.relpages DESC LIMIT 10;
     </listitem>
    </varlistentry>
 
+   <varlistentry>
+    <term>
+     <function>hash_index_check(index regclass) returns void</function>
+     <indexterm>
+      <primary>hash_index_check</primary>
+     </indexterm>
+    </term>
+
+    <listitem>
+     <para>
+      <function>hash_index_check</function> tests that its target hash index
+      respects structural invariants.  Verification checks the metapage,
+      bucket-to-block mappings, bucket and overflow page links, page flags,
+      and hash tuple ordering and bucket membership.
+     </para>
+     <para>
+      <function>hash_index_check</function> acquires a <literal>ShareLock</literal>
+      on the target index and the heap relation it belongs to.  These locks
+      prevent concurrent data modification while verification walks bucket
+      chains and compares them to the metapage.
+     </para>
+    </listitem>
+   </varlistentry>
+
   </variablelist>
   <tip>
    <para>
