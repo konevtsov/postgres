@@ -58,19 +58,26 @@ static void hash_index_check_callback(Relation rel, Relation heaprel,
 									  void *callback_state, bool readonly);
 static void hash_check_metapage(HashCheckState *state, Page metapage);
 static void hash_check_bucket_chain(HashCheckState *state, Bucket bucket);
+static void hash_mark_overflow_bit_pages(HashCheckState *state);
 static void hash_check_bitmap_pages(HashCheckState *state);
 static void hash_check_split_flags(HashCheckState *state);
 static void hash_check_split_tuples(HashCheckState *state);
+static bool hash_new_bucket_needs_split_cleanup(HashCheckState *state,
+											 Bucket bucket);
 static void hash_check_page_opaque(HashCheckState *state, Page page,
 								   BlockNumber blkno, Bucket bucket,
 								   BlockNumber prevblkno, bool primary);
 static void hash_check_tuple_page(HashCheckState *state, Page page,
 								  BlockNumber blkno, Bucket bucket,
-								  bool split_cleanup);
+								  bool allow_misbucket,
+								  bool record_old_split_tuple,
+								  bool record_new_split_tuple,
+								  Bucket cleanup_bucket);
 static void hash_check_tuple(HashCheckState *state, Page page,
 							 BlockNumber blkno, OffsetNumber offnum,
 							 Bucket bucket, bool allow_misbucket,
-							 bool record_split_tuple,
+							 bool record_old_split_tuple,
+							 bool record_new_split_tuple,
 							 Bucket cleanup_bucket, uint32 *lasthashkey,
 							 bool *first);
 static void hash_check_unreachable_page(HashCheckState *state,
@@ -166,6 +173,9 @@ hash_index_check_callback(Relation rel, Relation heaprel,
 
 		state.bitmap_pages[mapblkno] = true;
 	}
+
+	/* Mark the blocks covered by the overflow bitmap before following chains. */
+	hash_mark_overflow_bit_pages(&state);
 
 	for (Bucket bucket = 0; bucket <= state.metap.hashm_maxbucket; bucket++)
 	{
@@ -276,6 +286,7 @@ hash_check_bucket_chain(HashCheckState *state, Bucket bucket)
 	BlockNumber prevblkno = InvalidBlockNumber;
 	bool		primary = true;
 	bool		split_cleanup = false;
+	bool		bucket_being_split = false;
 
 	if (blkno >= state->nblocks)
 		ereport(ERROR,
@@ -314,6 +325,13 @@ hash_check_bucket_chain(HashCheckState *state, Bucket bucket)
 							RelationGetRelationName(state->rel), bucket, blkno),
 					 errhint("Please REINDEX it.")));
 
+		if (!primary && !state->overflow_bit_pages[blkno])
+			ereport(ERROR,
+					(errcode(ERRCODE_INDEX_CORRUPTED),
+					 errmsg("index \"%s\" overflow page %u has no corresponding overflow bitmap bit",
+							RelationGetRelationName(state->rel), blkno),
+					 errhint("Please REINDEX it.")));
+
 		buf = _hash_getbuf_with_strategy(state->rel, blkno, HASH_READ,
 										  primary ? LH_BUCKET_PAGE : LH_OVERFLOW_PAGE,
 										  state->checkstrategy);
@@ -330,10 +348,19 @@ hash_check_bucket_chain(HashCheckState *state, Bucket bucket)
 		if (primary)
 		{
 			split_cleanup = H_NEEDS_SPLIT_CLEANUP(opaque);
+			bucket_being_split = H_BUCKET_BEING_SPLIT(opaque);
 			state->bucket_flags[bucket] = opaque->hasho_flag;
 		}
 
-		hash_check_tuple_page(state, page, blkno, bucket, split_cleanup);
+		hash_check_tuple_page(state, page, blkno, bucket,
+							  split_cleanup || bucket_being_split,
+							  split_cleanup,
+							  hash_new_bucket_needs_split_cleanup(state, bucket),
+							  (split_cleanup || bucket_being_split) ?
+							  _hash_get_newbucket_from_oldbucket(state->rel, bucket,
+														  state->metap.hashm_lowmask,
+														  state->metap.hashm_maxbucket) :
+							  InvalidBucket);
 
 		prevblkno = blkno;
 		blkno = opaque->hasho_nextblkno;
@@ -411,14 +438,14 @@ hash_check_page_opaque(HashCheckState *state, Page page, BlockNumber blkno,
 
 static void
 hash_check_tuple_page(HashCheckState *state, Page page, BlockNumber blkno,
-					  Bucket bucket, bool split_cleanup)
+					  Bucket bucket, bool allow_misbucket,
+					  bool record_old_split_tuple,
+					  bool record_new_split_tuple,
+					  Bucket cleanup_bucket)
 {
 	OffsetNumber maxoff = PageGetMaxOffsetNumber(page);
 	uint32		lasthashkey = 0;
 	bool		first = true;
-	Bucket		cleanup_bucket = InvalidBucket;
-	HashPageOpaque opaque = HashPageGetOpaque(page);
-	bool		allow_misbucket = split_cleanup || H_BUCKET_BEING_SPLIT(opaque);
 
 	if (maxoff > MaxIndexTuplesPerPage)
 		ereport(ERROR,
@@ -427,22 +454,19 @@ hash_check_tuple_page(HashCheckState *state, Page page, BlockNumber blkno,
 						RelationGetRelationName(state->rel), blkno),
 				 errhint("Please REINDEX it.")));
 
-	if (allow_misbucket)
-		cleanup_bucket = _hash_get_newbucket_from_oldbucket(state->rel, bucket,
-															state->metap.hashm_lowmask,
-															state->metap.hashm_maxbucket);
-
 	for (OffsetNumber offnum = FirstOffsetNumber;
 		 offnum <= maxoff;
 		 offnum = OffsetNumberNext(offnum))
 		hash_check_tuple(state, page, blkno, offnum, bucket, allow_misbucket,
-						 split_cleanup, cleanup_bucket, &lasthashkey, &first);
+						 record_old_split_tuple, record_new_split_tuple,
+						 cleanup_bucket, &lasthashkey, &first);
 }
 
 static void
 hash_check_tuple(HashCheckState *state, Page page, BlockNumber blkno,
 				 OffsetNumber offnum, Bucket bucket, bool allow_misbucket,
-				 bool record_split_tuple, Bucket cleanup_bucket,
+				 bool record_old_split_tuple, bool record_new_split_tuple,
+				 Bucket cleanup_bucket,
 				 uint32 *lasthashkey, bool *first)
 {
 	ItemId		itemid = PageGetItemIdCareful(state, page, blkno, offnum);
@@ -517,9 +541,12 @@ hash_check_tuple(HashCheckState *state, Page page, BlockNumber blkno,
 									 bucket),
 					 errhint("Please REINDEX it.")));
 
-	/* _hash_splitbucket() does not copy dead tuples to the new bucket. */
-	if (record_split_tuple && hashbucket == cleanup_bucket &&
-		!ItemIdIsDead(itemid))
+	/*
+	 * LP_DEAD is a hint maintained independently on the old and new copies.
+	 * Count old tuples regardless of that hint, and only require a matching
+	 * old tuple for a new tuple known to have been made by a split.
+	 */
+	if (record_old_split_tuple && hashbucket == cleanup_bucket)
 	{
 		HashSplitTupleKey key;
 		HashSplitTupleEntry *entry;
@@ -536,17 +563,43 @@ hash_check_tuple(HashCheckState *state, Page page, BlockNumber blkno,
 		}
 		entry->old_count++;
 	}
-	else if (hashbucket == bucket)
+	else if (record_new_split_tuple && hashbucket == bucket &&
+			 (itup->t_info & INDEX_MOVED_BY_SPLIT_MASK) != 0)
 	{
 		HashSplitTupleKey key;
 		HashSplitTupleEntry *entry;
+		bool		found;
 
 		MemSet(&key, 0, sizeof(key));
 		key.tid = itup->t_tid;
 		key.hashkey = hashkey;
-		entry = hash_search(state->split_tuples, &key, HASH_FIND, NULL);
-		if (entry != NULL)
-			entry->new_count++;
+		entry = hash_search(state->split_tuples, &key, HASH_ENTER, &found);
+		if (!found)
+		{
+			entry->old_count = 0;
+			entry->new_count = 0;
+		}
+		entry->new_count++;
+	}
+}
+
+static void
+hash_mark_overflow_bit_pages(HashCheckState *state)
+{
+	uint32		nbits = state->metap.hashm_spares[state->metap.hashm_ovflpoint];
+
+	for (uint32 bitno = 0; bitno < nbits; bitno++)
+	{
+		BlockNumber blkno = hash_bitno_to_blkno(&state->metap, bitno);
+
+		if (blkno >= state->nblocks)
+			ereport(ERROR,
+					(errcode(ERRCODE_INDEX_CORRUPTED),
+					 errmsg("index \"%s\" overflow bit %u maps to nonexistent block %u",
+							RelationGetRelationName(state->rel), bitno, blkno),
+					 errhint("Please REINDEX it.")));
+
+		state->overflow_bit_pages[blkno] = true;
 	}
 }
 
@@ -597,16 +650,8 @@ hash_check_bitmap_pages(HashCheckState *state)
 			bool		in_use = ISSET(freep, mapbit) != 0;
 			bool		expected;
 
-			if (blkno >= state->nblocks)
-				ereport(ERROR,
-						(errcode(ERRCODE_INDEX_CORRUPTED),
-						 errmsg("index \"%s\" overflow bit %u maps to nonexistent block %u",
-								RelationGetRelationName(state->rel), bitno, blkno),
-						 errhint("Please REINDEX it.")));
-
 			expected = state->bitmap_pages[blkno] ||
 				state->overflow_pages[blkno];
-			state->overflow_bit_pages[blkno] = true;
 
 			if (in_use != expected)
 				ereport(ERROR,
@@ -667,6 +712,22 @@ hash_check_split_flags(HashCheckState *state)
 				 errhint("Please REINDEX it.")));
 }
 
+/* Return true when bucket is the new half of a pending split cleanup. */
+static bool
+hash_new_bucket_needs_split_cleanup(HashCheckState *state, Bucket bucket)
+{
+	Bucket		old_bucket;
+
+	if (bucket <= state->metap.hashm_lowmask)
+		return false;
+
+	old_bucket = bucket & state->metap.hashm_lowmask;
+	return (state->bucket_flags[old_bucket] & LH_BUCKET_NEEDS_SPLIT_CLEANUP) != 0 &&
+		_hash_get_newbucket_from_oldbucket(state->rel, old_bucket,
+										  state->metap.hashm_lowmask,
+										  state->metap.hashm_maxbucket) == bucket;
+}
+
 static void
 hash_check_split_tuples(HashCheckState *state)
 {
@@ -676,7 +737,7 @@ hash_check_split_tuples(HashCheckState *state)
 	hash_seq_init(&status, state->split_tuples);
 	while ((entry = hash_seq_search(&status)) != NULL)
 	{
-		if (entry->old_count != entry->new_count)
+		if (entry->new_count > entry->old_count)
 			ereport(ERROR,
 				(errcode(ERRCODE_INDEX_CORRUPTED),
 				 errmsg("hash index \"%s\" has inconsistent tuples copied by a bucket split",
